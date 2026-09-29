@@ -8,9 +8,6 @@ A tool that hooks into Halo MCC's theater mode and gives you hotkeys for clippin
 - **Halo 3 / Halo 3: ODST** - kinda. It attaches and some of it works (pause, skip-forward, partial film-error blocking), consider it experimental.
 
 ## How to use it
-
-## Hotkeys
-
 | Key |  |
 |-----|--------------|
 | F1  | Keep the film open (stops it auto-exiting at the end) |
