@@ -1,6 +1,6 @@
 # Theater Utils
 
-A little tool that hooks into Halo MCC's theater mode and gives you hotkeys for clipping films: record, stop, pause, skip around, and (on Reach) save the clip out as a `.film`.
+A tool that hooks into Halo MCC's theater mode and gives you hotkeys for clipping films: record, stop, pause, skip around, and (on Reach) save the clip out as a `.film`.
 
 ## Support?
 
