@@ -1,0 +1,1700 @@
+//  Theater Utils - MCC theater clip/playback control for three Blam titles:
+//  Halo: Reach (haloreach.dll), Halo 3 (halo3.dll) and Halo 3: ODST (halo3odst.dll).
+//  Whichever of the three is loaded is detected at startup and its address
+//  profile selected; every address below is per-title (see TITLES[]).
+//
+//    F2  = RELEASE leaked sf_camera.blob / sf_snippet.film handles (fixes F5)
+//    F4  = ABORT / unstick   (clear a pending seek + reset the clip state)
+//    F5  = START recording   (clip state 0 -> 1, then resumes playback)
+//    F6  = STOP / capture    (clip state 1..3 -> 4)
+//    F7  = KEYFRAME INDEX    read-only dump of the table skip navigates
+//    F8  = PAUSE / PLAY      playback-speed float, 0 <-> previous
+//    F9  = SKIP BACK         skip_arm(1)  -> prev keyframe (~10 s)
+//    F10 = SKIP FORWARD      skip_arm(2)  -> next keyframe (~10 s)
+//    F3  = KEYFRAME CAPTURE  H3/ODST, opt-in via -kf. Live-tested: it does
+//                            reach the capture path but the write fails and
+//                            theater ejects you, so it is off by default.
+//    F12 = SAVE              Reach only (state 4 -> 11, commit)
+//    + film-error blocking   (NOP the 13 sites that raise the theater film error;
+//                             all three titles have exactly 13 raises + 1 reset)
+//    + save-failed blocking  Reach only (NOP the SAVE-FAILED popup + auto-recover
+//                             the stuck state-12 commit loop back to a clean state)
+//    ESC = restore everything and quit.
+//
+//  On attach it also provisions the save storage pool, whose Xbox async-storage
+//  init is orphaned on PC. Reach's F12 commit needs it.
+//
+//  Reach F12: the produced .film lands in the game folder as sf_snippet_<hex>.film;
+//  drop it into ...\Temporary\UserContent\HaloReach\Movie\ and open the Theater
+//  menu and MCC converts + lists it. Full RE notes: theater_playback_controls.md.
+//
+//  Halo 3 / ODST have no callable save(id,name,desc) entry - their commit runs
+//  through the in-game name/description keyboard flow (clip states 4->7->..->11),
+//  so F12 and the save-failed handling stay Reach-only. Everything else is ported.
+//
+//  cl /EHsc /O2 /std:c++17
+#include <windows.h>
+#include <tlhelp32.h>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#include <vector>
+#include <winternl.h>
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "user32.lib")
+
+// --- ANSI colors (Windows VT processing; enabled by enableVT() at startup) --
+#define C_RST  "\x1b[0m"
+#define C_GRN  "\x1b[92m"  // success  [+]
+#define C_RED  "\x1b[91m"  // error    [!] fatal
+#define C_YEL  "\x1b[93m"  // warning  [!] non-fatal / ignored input
+#define C_CYN  "\x1b[96m"  // action   [F5]/[F6]/[F12]
+#define C_MAG  "\x1b[95m"  // auto-recover
+#define C_GRY  "\x1b[90m"  // state trace
+#define C_BLD  "\x1b[1m"   // headers
+
+static void enableVT() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (GetConsoleMode(h, &mode))
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+
+// --- per-title address profiles (all RVAs are VA - 0x180000000) -------------
+//  Reach's numbers are the original, live-verified set. The Halo 3 / ODST sets
+//  were recovered from halo3.dll.i64 / halo3odst.dll.i64 by following the same
+//  anchor chain (sf_snippet.film + sf_camera.blob -> record start -> clip state
+//  -> per-frame update -> playback struct) and every byte pattern below was
+//  checked against the shipping DLLs.
+//
+//  The playback-state struct has the same shape in all three: pending skip
+//  direction at speed+0x14, error flag at speed+0x4C.
+
+struct Site { uint32_t rva; uint8_t len; uint8_t orig[7]; };
+
+// -- Halo: Reach - the 13 sites that RAISE byte_18278EE88 (+0x278EE88).
+static const Site SITES_REACH[] = {
+    {0x005A4B5, 7, {0xC6,0x05,0xCC,0x49,0x73,0x02,0x01}},
+    {0x005A920, 7, {0x44,0x88,0x35,0x61,0x45,0x73,0x02}},
+    {0x005B1E1, 7, {0xC6,0x05,0xA0,0x3C,0x73,0x02,0x01}},
+    {0x005B2AA, 7, {0xC6,0x05,0xD7,0x3B,0x73,0x02,0x01}},
+    {0x005BE9D, 7, {0xC6,0x05,0xE4,0x2F,0x73,0x02,0x01}},
+    {0x0171717, 7, {0x44,0x88,0x25,0x6A,0xD7,0x61,0x02}},
+    {0x0171979, 7, {0xC6,0x05,0x08,0xD5,0x61,0x02,0x01}},
+    {0x0171E0F, 7, {0xC6,0x05,0x72,0xD0,0x61,0x02,0x01}},
+    {0x035C53D, 7, {0xC6,0x05,0x44,0x29,0x43,0x02,0x01}},
+    {0x035CD3E, 7, {0xC6,0x05,0x43,0x21,0x43,0x02,0x01}},
+    {0x035D288, 7, {0xC6,0x05,0xF9,0x1B,0x43,0x02,0x01}},
+    {0x03AA70D, 6, {0x88,0x1D,0x75,0x47,0x3E,0x02,0x00}},
+    {0x03AAE97, 7, {0x44,0x88,0x25,0xEA,0x3F,0x3E,0x02}},
+};
+
+// -- Halo 3 - the 13 sites that RAISE byte_1821371A0 (+0x21371A0).
+//    The 14th write, +0xF304C in the playback reset, clears it - left intact.
+static const Site SITES_H3[] = {
+    {0x0035DCD, 7, {0x44,0x88,0x3D,0xCC,0x13,0x10,0x02}},
+    {0x0036443, 7, {0x44,0x88,0x25,0x56,0x0D,0x10,0x02}},
+    {0x00F1A31, 7, {0x40,0x88,0x2D,0x68,0x57,0x04,0x02}},
+    {0x00F22AD, 7, {0xC6,0x05,0xEC,0x4E,0x04,0x02,0x01}},
+    {0x00F2B39, 7, {0xC6,0x05,0x60,0x46,0x04,0x02,0x01}},
+    {0x00F2F0B, 7, {0xC6,0x05,0x8E,0x42,0x04,0x02,0x01}},
+    {0x0109D17, 7, {0xC6,0x05,0x82,0xD4,0x02,0x02,0x01}},
+    {0x01CE1D7, 7, {0x44,0x88,0x25,0xC2,0x8F,0xF6,0x01}},
+    {0x01CE3DB, 7, {0xC6,0x05,0xBE,0x8D,0xF6,0x01,0x01}},
+    {0x01CE7F8, 7, {0xC6,0x05,0xA1,0x89,0xF6,0x01,0x01}},
+    {0x0327F2A, 7, {0x40,0x88,0x35,0x6F,0xF2,0xE0,0x01}},
+    {0x0327FE7, 7, {0x40,0x88,0x35,0xB2,0xF1,0xE0,0x01}},
+    {0x0329489, 7, {0x40,0x88,0x35,0x10,0xDD,0xE0,0x01}},
+};
+
+// -- Halo 3: ODST - the 13 sites that RAISE byte_182175080 (+0x2175080).
+//    Reset at +0x10E7DC left intact, same as the other two.
+static const Site SITES_ODST[] = {
+    {0x00380D7, 7, {0x44,0x88,0x3D,0xA2,0xCF,0x13,0x02}},
+    {0x0038887, 7, {0x44,0x88,0x25,0xF2,0xC7,0x13,0x02}},
+    {0x010D1C1, 7, {0x40,0x88,0x2D,0xB8,0x7E,0x06,0x02}},
+    {0x010DA3D, 7, {0xC6,0x05,0x3C,0x76,0x06,0x02,0x01}},
+    {0x010E2C9, 7, {0xC6,0x05,0xB0,0x6D,0x06,0x02,0x01}},
+    {0x010E69B, 7, {0xC6,0x05,0xDE,0x69,0x06,0x02,0x01}},
+    {0x012842B, 7, {0xC6,0x05,0x4E,0xCC,0x04,0x02,0x01}},
+    {0x020318B, 7, {0x44,0x88,0x25,0xEE,0x1E,0xF7,0x01}},
+    {0x020338F, 7, {0xC6,0x05,0xEA,0x1C,0xF7,0x01,0x01}},
+    {0x02037AC, 7, {0xC6,0x05,0xCD,0x18,0xF7,0x01,0x01}},
+    {0x035F40E, 7, {0x40,0x88,0x35,0x6B,0x5C,0xE1,0x01}},
+    {0x035F4CB, 7, {0x40,0x88,0x35,0xAE,0x5B,0xE1,0x01}},
+    {0x0360A69, 7, {0x40,0x88,0x35,0x10,0x46,0xE1,0x01}},
+};
+
+// -- Reach SAVE-FAILED popup: the two `call sub_1802D8178` sites (code 0x10006D)
+//    in the clip pump sub_18017271C (state-12 and state-14 failure).
+static const uint32_t POPUP_REACH[] = { 0x172A1B /*state 12*/, 0x17287F /*state 14*/ };
+
+// -- Halo 3: ALL 74 `call sub_1802CC0C4` notification sites.
+//    Every one is a 5-byte E8 rel32 whose return value is unused, so NOPing
+//    is control-flow neutral. This is a BLANKET suppression: it silences the
+//    whole modal/toast layer, not just film errors - network, matchmaking,
+//    sign-in and storage messages go quiet too. Requested deliberately; the
+//    film ones are the two marked below. All 74 verified against the DLL.
+static const uint32_t POPUP_H3[] = {
+    0x10063, 0x42CA5, 0x42CF9, 0x45D1F, 0x481D6,
+    0x6A456, 0x6D725, 0x7319A, 0x146BEF, 0x147007,
+    0x1CEE81 /*clip pump SAVE-FAILED*/,
+    0x2215FD, 0x2BA99E, 0x2BAA0C, 0x2BABAD, 0x2BAC35,
+    0x2BAD8A, 0x2BD7F6, 0x2BE3E8, 0x2BE41B, 0x2BE4BB,
+    0x2BEA76, 0x2BED0F, 0x2BF44C, 0x2CBA6F, 0x2CBB90,
+    0x2D7564, 0x2D8762, 0x2F82EF, 0x2F898B, 0x2F9E4D,
+    0x2FA1E6, 0x2FA3D2, 0x2FD009, 0x2FD054, 0x2FF1C3,
+    0x2FF1F2, 0x2FF402, 0x2FF4E3, 0x2FF606, 0x2FF642,
+    0x2FF66D, 0x2FF79A, 0x2FF7C9, 0x30368C, 0x304662,
+    0x305D58, 0x3063BE, 0x306528, 0x306CE0, 0x307153,
+    0x3087C1, 0x30AB6D, 0x30BD3B, 0x30BF17, 0x30E828,
+    0x311039, 0x3118D6, 0x317742, 0x3177FE, 0x317CCA,
+    0x3190BE /*SAVE-FAILED UI*/,
+    0x3206DC, 0x322076, 0x3220A5, 0x32245C, 0x322487,
+    0x3225E2, 0x322611, 0x32275A, 0x3228DD, 0x322907,
+    0x32AD50, 0x3356F2,
+};
+// Film-error codes -> the site that raises them. The flag writes are NOP'd but
+// the engine still records the CODE, which makes it a free running diagnostic:
+// whatever went wrong names itself.
+struct ErrCode { uint8_t code; const char* where; };
+static const ErrCode ERRCODES_H3[] = {
+    { 2,  "sub_1800F1850 per-frame update - the clip pump returned false"},
+    { 3,  "sub_1800361A8 sim tick - sub_1801CF3BC returned false (clip stuck/failed)"},
+    { 4,  "sub_180327D0C theater UI"},
+    { 5,  "sub_180327D0C theater UI"},
+    { 6,  "sub_1800F2280 replay / DVR start"},
+    { 8,  "sub_1803292E4 theater UI (save clip)"},
+    {10,  "KEYFRAME write or read failed (sub_1801CDF40 / sub_1801CE258)"},
+    {12,  "APPLY KEYFRAME failed (sub_1801CE468) - CRC or read error"},
+    {13,  "sub_1800F2E14 seek/skip consume - no keyframe to land on"},
+    {14,  "sub_1800F2A6C"},
+    {15,  "sub_180109C00"},
+};
+static const ErrCode ERRCODES_REACH[] = {
+    { 1,  "sub_1803AA268 frame build"},
+    { 2,  "sub_18005A758 update - pump failed"},
+    { 3,  "sub_1803AABD0 advance / pump"},
+    { 4,  "sub_18035D1B0 record-clip UI"},
+    { 5,  "sub_18035CD08 clip stop"},
+    { 6,  "sub_18005B1B4 seek/segment"},
+    { 8,  "sub_18035C510 save-clip UI"},
+    { 9,  "sub_18005B208 clip save op"},
+    {10,  "keyframe writer (sub_1801714D0 / sub_180171800)"},
+    {12,  "apply keyframe (sub_180171A0C)"},
+    {13,  "sub_18005BD9C marker-seek consume"},
+    {15,  "sub_18005A3B8 theater tick - header/version mismatch"},
+};
+
+struct Title {
+    const wchar_t* module;
+    const char*    name;
+    uint32_t hook;                 // per-frame theater fn we cave into
+    uint8_t  hookLen, hookOrig[8]; // its stolen prologue (re-run by the cave)
+    uint32_t start, stop, skip;    // clip record start / stop, skip_arm(dir)
+    uint32_t poolInit, pool;       // xoverlapped pool creator + its ptr global
+    uint32_t state, speed, tick;   // clip state machine, speed float, film tick
+    uint32_t saveReal, clipId;     // real save(id,name,desc) + minted id (0 = n/a)
+    uint32_t opBase;               // save-op object for auto-recover (0 = n/a)
+    // keyframe index: what skip back/forward actually navigates. Entries are
+    // {tick at +4, ..., valid flag in the last byte}; the payload each entry
+    // points at is a multi-MB state snapshot in a scratch file, not in here.
+    uint32_t kfTable; uint8_t kfSlots, kfStride, kfTickOff, kfValidOff;
+    uint32_t clipReset;            // engine's own clip-state reset, no args (0 = n/a)
+    // Clip length budget. STOP only succeeds while
+    //   clipStart + clipMaxLen - tick >= 0
+    // and in Halo 3 / ODST this global has exactly ONE xref in the whole binary -
+    // that read - so nothing ever initialises it and it stays 0. That collapses
+    // the stop window to the single tick the clip started on, i.e. recording can
+    // never be stopped. Seeding it makes STOP reachable again.
+    uint32_t clipMaxLen, clipStart, clipEnd;
+    // Record-start does three things in order and any one can silently abort it:
+    //   sub_1800B4E78(camblob, "sf_camera.blob", 2)     -> handle at blob+144
+    //   sub_180107590(writer, "sf_snippet.film", ...)   -> writer state at +0
+    //   sub_1800F2300(tick, 0)                          -> the seek
+    // These let the tool say WHICH step failed instead of guessing. 0 = unmapped.
+    uint32_t camBlobHandle, camBlobMode, filmWriterState;
+    // Record-start opens sf_camera.blob and sf_snippet.film and NOTHING closes
+    // them - the clip reset doesn't, so the handles leak for the life of the
+    // process. Since the engine opens with ShareMode: None, every later attempt
+    // dies with a SHARING VIOLATION and record-start silently fails. These are
+    // the engine's own close routines (as used by the theater teardown
+    // sub_1800F16FC), each taking one pointer, so F4 can call them.
+    uint32_t closeBlobFn, camBlobObj, closeWriterFn, filmWriterObj;
+    uint32_t filmWriterErr;        // writer object + 65524, must be 0 to finalise
+    // The stop's length-budget load:
+    //     mov ecx, cs:<budget>      8B 0D rel32   (6 bytes)
+    //     sub ecx, eax / add ecx, edx / js -> fail
+    // The budget global lives INSIDE the film-writer object and the engine holds
+    // it at 0 for the whole recording (writing it back is undone within a frame),
+    // so the window collapses to tick == clipStart and stop can never succeed.
+    // Replacing the load with `mov ecx, imm32; nop` supplies the budget at the
+    // point of use where nothing can zero it. 0 = don't patch (Reach's clip
+    // recorder works as shipped - leave it alone).
+    uint32_t clipLenPatch;
+    // Keyframe capture-mode gates. The keyframe writer runs every tick but bails
+    // unless the film block's mode byte is 2; during theater playback it is 1,
+    // so no keyframe is ever captured and skip/rewind has nothing to jump to.
+    // These are the two `cmp byte ptr [rax+10h], 2` sites in the writer - drop
+    // the immediate to 1 and it captures during playback instead. Experimental,
+    // off by default (F11).
+    // THREE gates, not two. Two live in the writer sub_1801CDF40 and let the
+    // 9.9 MB snapshot get written; the third is in the per-tick caller
+    // sub_1800361A8 and guards the block that PUBLISHES the index entry - it
+    // stamps entry +0/+4(tick)/+12 and `mov word [..+1Eh], 100h` = valid.
+    // Patch only the first two and the data lands but no slot ever validates,
+    // so skip still has nothing to navigate. Encodings differ: the writer's are
+    // `cmp byte [rax+10h],2` (80 78 10 02), the finaliser's is [rcx+10h]
+    // (80 79 10 02), so each carries its expected modrm.
+    uint32_t kfGate[3];
+    uint8_t  kfGateModrm[3];
+    const ErrCode*  codes; int nCodes;
+    const Site*     err;  int nErr;
+    const uint32_t* popup; int nPopup;
+};
+
+static const Title TITLES[] = {
+  { L"haloreach.dll", "Halo: Reach",
+    0x1741FC, 7, {0x48,0x8B,0xC4,0x48,0x89,0x58,0x10},   // mov rax,rsp; mov [rax+10h],rbx
+    0x17245C, 0x172518, 0x05B184,
+    0x0D2878, 0x4E306B8,
+    0x29BBA38, 0x278EE3C, 0x275A228,
+    0x05B208, 0x29B9F20,
+    0x29BA358,
+    0x2999428, 11, 56, 4, 0x33,
+    0x17337C,     // sub_18017337C: clip reset, no args
+    0x29B9010, 0x29B9D0C, 0x29B9D10,
+    0, 0, 0,   // Reach record-start probes not mapped
+    0, 0, 0, 0,   // Reach close routines not mapped
+    0,
+    0,   // Reach clip recorder works as shipped - no budget patch
+    {0, 0, 0}, {0, 0, 0},   // Reach capture gates not mapped
+    ERRCODES_REACH, (int)(sizeof(ERRCODES_REACH)/sizeof(ErrCode)),
+    SITES_REACH, (int)(sizeof(SITES_REACH)/sizeof(Site)),
+    POPUP_REACH, (int)(sizeof(POPUP_REACH)/sizeof(uint32_t)) },
+
+  { L"halo3.dll", "Halo 3",
+    0x0F1850, 7, {0x48,0x8B,0xC4,0x48,0x89,0x58,0x18},   // mov rax,rsp; mov [rax+18h],rbx
+    0x1CEAE4, 0x1CEB8C, 0x0F2250,
+    0x1227D8, 0x46B7718,
+    0x94C850, 0x2137154, 0x1FD1E18,
+    0, 0,
+    0,
+    0x2285EF8, 16, 24, 4, 23,
+    0x1CF670,     // sub_1801CF670: clip reset, no args
+    0x94C330, 0x94C708, 0x94C70C,
+    0x93C4F0, 0x93C4E8, 0x93C510,   // camblob handle/mode, film writer state
+    0xB501C, 0x93C460, 0x107E04, 0x93C510,   // close blob / close writer + their objects
+    0x94C504,                                // film writer error byte
+    0x1CEBA8,                                // budget load in sub_1801CEB8C
+    {0x1CDF88, 0x1CE038, 0x3632E}, {0x78, 0x78, 0x79},
+    ERRCODES_H3, (int)(sizeof(ERRCODES_H3)/sizeof(ErrCode)),
+    SITES_H3, (int)(sizeof(SITES_H3)/sizeof(Site)),
+    POPUP_H3, (int)(sizeof(POPUP_H3)/sizeof(uint32_t)) },
+
+  { L"halo3odst.dll", "Halo 3: ODST",
+    0x10CFE0, 7, {0x48,0x8B,0xC4,0x48,0x89,0x58,0x18},   // same prologue as Halo 3
+    0x203A98, 0x203B40, 0x10D9E0,
+    0x1433F4, 0x46E29E8,
+    0x993400, 0x2175034, 0x2022BB4,
+    0, 0,
+    0,
+    0x22C9E28, 16, 24, 4, 23,
+    0x2049E4,     // sub_1802049E4: clip reset, no args
+    0x992EE0, 0x9932B8, 0x9932BC,
+    0, 0, 0,   // ODST record-start probes not mapped
+    0, 0, 0, 0,   // ODST close routines not mapped
+    0,
+    0x203B5C,   // budget load in sub_180203B40
+    {0x202F3C, 0x202FEC, 0x38772}, {0x78, 0x78, 0x79},
+    ERRCODES_H3, (int)(sizeof(ERRCODES_H3)/sizeof(ErrCode)),   // same engine
+    SITES_ODST, (int)(sizeof(SITES_ODST)/sizeof(Site)),
+    nullptr, 0 },
+};
+static const int N_TITLES = (int)(sizeof(TITLES) / sizeof(TITLES[0]));
+
+// The detected title; every address in the program is read through this.
+static const Title* g_t = nullptr;
+
+// Clip length budget seeded at record start on titles that never set one.
+// 30 s matches the usual Halo snippet length; override with -len <seconds>.
+static int32_t g_clipLenTicks = 30 * 30;
+// The budget code patch is OFF by default. It was needed only because the
+// engine pinned the field at 0 while the clip was stuck in state 1 - once
+// recording actually starts (keyframe applied), the engine sets a real,
+// LARGER budget itself (measured: 1734 ticks). Forcing 900 then truncates
+// the allowed window and makes the stop fail. -budget <seconds> re-enables.
+static bool g_forceBudget = false;
+// F1: keep dword_182137170 (end tick) at -1 so the film never auto-exits.
+static bool g_holdOpen = false;
+
+// ---------------------------------------------------------------------------
+static void enableDebugPriv() {
+    HANDLE tok;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &tok)) return;
+    TOKEN_PRIVILEGES tp{}; tp.PrivilegeCount = 1;
+    LookupPrivilegeValue(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid);
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+    CloseHandle(tok);
+}
+
+// Find whichever supported title is loaded and select its profile. MCC only has
+// one game DLL mapped at a time, so the first match wins.
+static bool findModule(DWORD& pidOut, uint64_t& baseOut, const Title*& titleOut) {
+    HANDLE ps = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (ps == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{ sizeof(pe) };
+    bool found = false;
+    for (BOOL ok = Process32FirstW(ps, &pe); ok && !found; ok = Process32NextW(ps, &pe)) {
+        HANDLE ms = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pe.th32ProcessID);
+        if (ms == INVALID_HANDLE_VALUE) continue;
+        MODULEENTRY32W me{ sizeof(me) };
+        for (BOOL m = Module32FirstW(ms, &me); m && !found; m = Module32NextW(ms, &me)) {
+            for (int i = 0; i < N_TITLES; i++) {
+                if (_wcsicmp(me.szModule, TITLES[i].module) == 0) {
+                    pidOut = pe.th32ProcessID; baseOut = (uint64_t)me.modBaseAddr;
+                    titleOut = &TITLES[i]; found = true; break;
+                }
+            }
+        }
+        CloseHandle(ms);
+    }
+    CloseHandle(ps);
+    return found;
+}
+
+static uint64_t allocNear(HANDLE proc, uint64_t anchor, SIZE_T size) {
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    const uint64_t gran = si.dwAllocationGranularity;
+    const uint64_t limit = 0x78000000ull; // ~1.9GB (E9 rel32 reach)
+    uint64_t start = anchor & ~(gran - 1);
+    for (uint64_t off = gran; off < limit; off += gran) {
+        for (int dir = 0; dir < 2; ++dir) {
+            uint64_t cand = dir ? start + off : start - off;
+            void* p = VirtualAllocEx(proc, (void*)cand, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            if (p) return (uint64_t)p;
+        }
+    }
+    return 0;
+}
+
+template<class T> static bool wr(HANDLE p, uint64_t a, const T& v) {
+    SIZE_T n; return WriteProcessMemory(p, (void*)a, &v, sizeof(T), &n) && n == sizeof(T);
+}
+static bool wrBuf(HANDLE p, uint64_t a, const void* b, SIZE_T len) {
+    SIZE_T n; return WriteProcessMemory(p, (void*)a, b, len, &n) && n == len;
+}
+static bool rdBuf(HANDLE p, uint64_t a, void* b, SIZE_T len) {
+    SIZE_T n; return ReadProcessMemory(p, (void*)a, b, len, &n) && n == len;
+}
+static bool wrCode(HANDLE p, uint64_t a, const void* b, SIZE_T len) {
+    DWORD old; if (!VirtualProtectEx(p, (void*)a, len, PAGE_EXECUTE_READWRITE, &old)) return false;
+    bool ok = wrBuf(p, a, b, len);
+    VirtualProtectEx(p, (void*)a, len, old, &old);
+    FlushInstructionCache(p, (void*)a, len);
+    return ok;
+}
+
+// Format a byte buffer as "48 8B C4" into the caller's buffer (a shared static
+// would collide when two calls appear in one printf argument list).
+static char* hexBytes(char* out, int cap, const uint8_t* b, int len) {
+    int p = 0;
+    for (int i = 0; i < len && p < cap - 3; i++)
+        p += snprintf(out + p, cap - p, "%s%02X", i ? " " : "", b[i]);
+    return out;
+}
+
+// film-error: verify each site is original-or-NOP, then NOP. -1 if any mismatch.
+static int filmErrApply(HANDLE proc, uint64_t base) {
+    const uint8_t nops[7] = {0x90,0x90,0x90,0x90,0x90,0x90,0x90};
+    for (int i = 0; i < g_t->nErr; i++) {
+        uint8_t cur[7] = {0};
+        if (!rdBuf(proc, base + g_t->err[i].rva, cur, g_t->err[i].len)) return -1;
+        bool isOrig = memcmp(cur, g_t->err[i].orig, g_t->err[i].len) == 0;
+        bool isNop = true; for (int k = 0; k < g_t->err[i].len; k++) if (cur[k] != 0x90) isNop = false;
+        if (!isOrig && !isNop) return -1;
+    }
+    int count = 0;
+    for (int i = 0; i < g_t->nErr; i++)
+        if (wrCode(proc, base + g_t->err[i].rva, nops, g_t->err[i].len)) count++;
+    return count;
+}
+static void filmErrRevert(HANDLE proc, uint64_t base) {
+    for (int i = 0; i < g_t->nErr; i++)
+        wrCode(proc, base + g_t->err[i].rva, g_t->err[i].orig, g_t->err[i].len);
+}
+
+// Keyframe capture during playback (EXPERIMENTAL, F11).
+//
+// The keyframe writer runs every tick but opens with `cmp byte [rax+10h], 2` on
+// the film block's mode byte. Live probing of Halo 3 theater shows that byte is
+// 1 during playback, so the writer bails on every single tick: the keyframe file
+// is never opened, the 16-slot index stays all-empty, and skip back/forward have
+// nothing to navigate. Lowering the two gate immediates 2 -> 1 lets it capture
+// while a film plays, which is what gives skip something to jump to.
+//
+// Cost when enabled: the engine writes a ~9.9 MB state snapshot every 300 ticks
+// (10 s) of playback, so expect a periodic disk hitch. Fully reversible.
+// TESTED 2026-07-28 on Halo 3: flipping the gates DOES let the writer reach its
+// capture path, but the snapshot write then fails (writer error 10) and the film
+// errors out / ejects you from theater. During playback the keyframe scratch
+// file is not set up for writing, so the mode gate was necessary but not
+// sufficient. Left in for further investigation but now OFF unless you pass -kf,
+// because an accidental press costs you the film.
+static bool g_kfOn = false;
+// Keyframe capture is ON by default on Halo 3 / ODST. It was opt-in while only
+// two of the three gates were known and the experiment looked like it broke the
+// film; with all three patched it is live-verified working (ring fills on the
+// 600-tick grid, skip-back lands exactly on keyframes). It is also a hard
+// PREREQUISITE for clip recording - the clip only leaves state 1 when a keyframe
+// is applied - so defaulting it off made F5 impossible. -nokf disables it.
+static bool g_kfEnabled = true;
+static int kfGateSet(HANDLE proc, uint64_t base, uint8_t want) {
+    if (!g_t->kfGate[0]) return -1;
+    const uint8_t expect = (want == 1) ? 2 : 1;      // what it should currently be
+    for (int i = 0; i < 3; i++) {
+        uint8_t cur[4] = {0};
+        if (!rdBuf(proc, base + g_t->kfGate[i], cur, 4)) return -1;
+        if (cur[0] != 0x80 || cur[1] != g_t->kfGateModrm[i] || cur[2] != 0x10) return -1;
+        if (cur[3] != expect && cur[3] != want) return -1;
+    }
+    int n = 0;
+    for (int i = 0; i < 3; i++)
+        if (wrCode(proc, base + g_t->kfGate[i] + 3, &want, 1)) n++;
+    return n;
+}
+
+// SAVE-FAILED popup (Reach only): NOP the E8 `call sub_1802D8178`. Stash originals.
+#define MAX_POPUP 128
+static uint8_t g_popupOrig[MAX_POPUP][5];
+static bool    g_popupSaved = false;
+static int popupApply(HANDLE proc, uint64_t base) {
+    if (g_t->nPopup <= 0) return -1;              // title has no popup sites mapped
+    for (int i = 0; i < g_t->nPopup; i++) {
+        uint8_t cur[5] = {0};
+        if (!rdBuf(proc, base + g_t->popup[i], cur, 5)) return -1;
+        bool isCall = cur[0] == 0xE8;
+        bool isNop  = cur[0]==0x90 && cur[1]==0x90 && cur[2]==0x90 && cur[3]==0x90 && cur[4]==0x90;
+        if (!isCall && !isNop) return -1;
+    }
+    // Only capture the originals from a genuine `call` - this runs repeatedly to
+    // re-assert the patch, and stashing already-NOP'd bytes would make cleanup
+    // "restore" NOPs over the real instruction.
+    if (!g_popupSaved) {
+        bool allCalls = true;
+        for (int i = 0; i < g_t->nPopup; i++) {
+            uint8_t cur[5] = {0};
+            if (!rdBuf(proc, base + g_t->popup[i], cur, 5) || cur[0] != 0xE8) allCalls = false;
+        }
+        if (allCalls) {
+            for (int i = 0; i < g_t->nPopup; i++)
+                rdBuf(proc, base + g_t->popup[i], g_popupOrig[i], 5);
+            g_popupSaved = true;
+        }
+    }
+    const uint8_t nop5[5] = {0x90,0x90,0x90,0x90,0x90};
+    int n = 0;
+    for (int i = 0; i < g_t->nPopup; i++)
+        if (wrCode(proc, base + g_t->popup[i], nop5, 5)) n++;
+    return n;
+}
+static void popupRevert(HANDLE proc, uint64_t base) {
+    if (!g_popupSaved) return;
+    for (int i = 0; i < g_t->nPopup; i++)
+        wrCode(proc, base + g_t->popup[i], g_popupOrig[i], 5);
+}
+
+// --- clip length budget: patch the LOAD, not the global ---------------------
+// sub_1801CEB8C's window check reads the budget out of a field the engine keeps
+// at 0 for the whole recording, so `clipStart + budget - tick >= 0` only holds
+// on the exact tick recording began. Writing the global back is undone within a
+// frame (measured). Replacing the 6-byte RIP-relative load with a 5-byte
+// immediate + nop supplies the value where nothing can clear it.
+static uint8_t g_lenOrig[6];
+static bool    g_lenPatched = false;
+static bool clipLenApply(HANDLE proc, uint64_t base, int32_t ticks) {
+    if (!g_t->clipLenPatch) return false;
+    uint8_t cur[6] = {0};
+    if (!rdBuf(proc, base + g_t->clipLenPatch, cur, 6)) return false;
+    bool stock = (cur[0] == 0x8B && cur[1] == 0x0D);   // mov ecx, [rip+rel32]
+    bool done  = (cur[0] == 0xB9 && cur[5] == 0x90);   // already patched
+    if (!stock && !done) return false;
+    if (stock) memcpy(g_lenOrig, cur, 6);
+    uint8_t pat[6] = { 0xB9, 0, 0, 0, 0, 0x90 };       // mov ecx, imm32 ; nop
+    memcpy(pat + 1, &ticks, 4);
+    if (!wrCode(proc, base + g_t->clipLenPatch, pat, 6)) return false;
+    g_lenPatched = true;
+    return true;
+}
+static void clipLenRevert(HANDLE proc, uint64_t base) {
+    if (g_lenPatched && g_t->clipLenPatch)
+        wrCode(proc, base + g_t->clipLenPatch, g_lenOrig, 6);
+}
+
+// One dump with everything that decides whether a clip can start or stop, so a
+// failure report is self-contained instead of needing another round trip.
+static void clipDiag(HANDLE proc, uint64_t base, const char* why) {
+    auto d32 = [&](uint32_t rva) { int32_t v = 0; if (rva) rdBuf(proc, base + rva, &v, 4); return v; };
+    auto d64 = [&](uint32_t rva) { uint64_t v = 0; if (rva) rdBuf(proc, base + rva, &v, 8); return v; };
+    auto d8  = [&](uint32_t rva) { uint8_t  v = 0; if (rva) rdBuf(proc, base + rva, &v, 1); return v; };
+
+    int32_t tick = d32(g_t->tick), st = d32(g_t->state);
+    int32_t cs = d32(g_t->clipStart), ce = d32(g_t->clipEnd), budget = d32(g_t->clipMaxLen);
+    float sp = 0.0f; rdBuf(proc, base + g_t->speed, &sp, 4);
+
+    printf(C_BLD "\n  ---- clip diagnostics (%s) ----\n" C_RST, why);
+    printf("   film     tick %-8d %7.1fs   speed %.2fx   state %d\n", tick, tick / 30.0, sp, st);
+    printf("   clip     start %-8d end %-8d budget %d\n", cs, ce, budget);
+
+    // is the budget load actually patched right now?
+    if (g_t->clipLenPatch) {
+        uint8_t b[6] = {0};
+        rdBuf(proc, base + g_t->clipLenPatch, b, 6);
+        bool patched = (b[0] == 0xB9 && b[5] == 0x90);
+        int32_t imm = 0; memcpy(&imm, b + 1, 4);
+        printf("   budget load +0x%-7X %02X %02X %02X %02X %02X %02X  %s%s\n" C_RST,
+               g_t->clipLenPatch, b[0], b[1], b[2], b[3], b[4], b[5],
+               patched ? C_GRN : C_RED,
+               patched ? "PATCHED" : "NOT PATCHED - the stop window can never pass");
+        if (patched) printf("   effective budget = %d ticks (%.0fs)\n", imm, imm / 30.0);
+    }
+
+    // the three conditions of sub_1801CEB8C, in the order the engine tests them
+    int32_t eff = budget;
+    if (g_t->clipLenPatch) {
+        uint8_t b[6] = {0}; rdBuf(proc, base + g_t->clipLenPatch, b, 6);
+        if (b[0] == 0xB9) memcpy(&eff, b + 1, 4);
+    }
+    bool win = (tick >= 0 && tick >= cs && (cs + eff - tick) >= 0);
+    int32_t ws = d32(g_t->filmWriterState), gate = g_t->camBlobObj ? d32(g_t->camBlobObj + 140) : -1;
+    uint8_t werr = d8(g_t->filmWriterErr);
+    uint64_t bh = d64(g_t->camBlobHandle);
+    int32_t bmode = d32(g_t->camBlobMode);
+    printf("   [1] window   %s  tick>=0 && tick>=start && start+budget-tick>=0\n"
+           "                    -> %d >= %d && %d + %d - %d = %d\n",
+           win ? C_GRN "PASS" C_RST : C_RED "FAIL" C_RST, tick, cs, cs, eff, tick, cs + eff - tick);
+    printf("   [2] writer   %s  sub_180107E04: state %d (want 0/1), err %u (want 0)\n",
+           (ws == 0 || ws == 1) ? C_GRN "PASS" C_RST : C_RED "FAIL" C_RST, ws, werr);
+    printf("   [3] camblob  %s  sub_1801CFA0C: dword+140 = %d (want exactly 1)\n",
+           gate == 1 ? C_GRN "PASS" C_RST : C_RED "FAIL" C_RST, gate);
+    printf("   camblob  handle 0x%llX  mode %d\n", (unsigned long long)bh, bmode);
+    printf(C_GRY "   note: the engine returns at the FIRST failing condition, so a later\n"
+           "   line reading -1 may simply mean it was never reached.\n" C_RST);
+
+    // keyframe ring summary - cheap and often relevant
+    if (g_t->kfTable) {
+        std::vector<uint8_t> kb((size_t)g_t->kfSlots * g_t->kfStride);
+        if (rdBuf(proc, base + g_t->kfTable, kb.data(), kb.size())) {
+            int live = 0;
+            for (int i = 0; i < g_t->kfSlots; i++)
+                if (kb[(size_t)i * g_t->kfStride + g_t->kfValidOff]) live++;
+            printf("   keyframes %d/%u valid   err flag %u code %d\n\n",
+                   live, g_t->kfSlots, d8(g_t->speed + 0x4C), d32(g_t->speed + 0x50));
+        }
+    }
+}
+
+// --- releasing the leaked clip file handles ---------------------------------
+// Record-start opens sf_camera.blob / sf_snippet.film with ShareMode: None and
+// nothing ever closes them. Worse, a failed retry overwrites the file object's
+// handle field with -1, so the real OS handle becomes ORPHANED - the engine's
+// own close can no longer reach it, and every later CreateFile gets a SHARING
+// VIOLATION for the life of the process.
+//
+// Fix it from outside: enumerate the game's handles, find the ones whose final
+// path is one of those two files, and close them in the target with
+// DUPLICATE_CLOSE_SOURCE. Only FILE_TYPE_DISK handles are inspected, so this
+// can't stall on a synchronous pipe the way a blind NtQueryObject would.
+typedef NTSTATUS (NTAPI *fnNtQSI)(ULONG, PVOID, ULONG, PULONG);
+#define SystemExtendedHandleInformation 64
+
+struct SYS_HANDLE_ENTRY {
+    PVOID  Object;
+    ULONG_PTR UniqueProcessId;
+    HANDLE HandleValue;
+    ULONG  GrantedAccess;
+    USHORT CreatorBackTraceIndex;
+    USHORT ObjectTypeIndex;
+    ULONG  HandleAttributes;
+    ULONG  Reserved;
+};
+struct SYS_HANDLE_INFO_EX {
+    ULONG_PTR NumberOfHandles;
+    ULONG_PTR Reserved;
+    SYS_HANDLE_ENTRY Handles[1];
+};
+
+static int releaseClipHandles(HANDLE proc, DWORD pid) {
+    fnNtQSI NtQSI = (fnNtQSI)GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                            "NtQuerySystemInformation");
+    if (!NtQSI) { printf(C_RED "[F2] NtQuerySystemInformation unavailable\n" C_RST); return -1; }
+
+    ULONG cap = 1 << 20;
+    std::vector<uint8_t> buf;
+    NTSTATUS st;
+    for (;;) {
+        buf.assign(cap, 0);
+        ULONG need = 0;
+        st = NtQSI(SystemExtendedHandleInformation, buf.data(), cap, &need);
+        if (st == (NTSTATUS)0xC0000004L /*INFO_LENGTH_MISMATCH*/) { cap *= 2; continue; }
+        break;
+    }
+    if (st < 0) { printf(C_RED "[F2] handle enumeration failed (0x%lX)\n" C_RST, (unsigned long)st); return -1; }
+
+    auto* info = (SYS_HANDLE_INFO_EX*)buf.data();
+    int closed = 0, looked = 0;
+    for (ULONG_PTR i = 0; i < info->NumberOfHandles; i++) {
+        const SYS_HANDLE_ENTRY& e = info->Handles[i];
+        if ((DWORD)e.UniqueProcessId != pid) continue;
+        HANDLE dup = nullptr;
+        if (!DuplicateHandle(proc, e.HandleValue, GetCurrentProcess(), &dup, 0, FALSE,
+                             DUPLICATE_SAME_ACCESS))
+            continue;
+        // Only disk files - never touches pipes, so no stall risk.
+        if (GetFileType(dup) == FILE_TYPE_DISK) {
+            char path[MAX_PATH] = {0};
+            DWORD n = GetFinalPathNameByHandleA(dup, path, MAX_PATH, FILE_NAME_NORMALIZED);
+            if (n && n < MAX_PATH) {
+                looked++;
+                const char* leaf = strrchr(path, '\\');
+                leaf = leaf ? leaf + 1 : path;
+                if (_stricmp(leaf, "sf_camera.blob") == 0 || _stricmp(leaf, "sf_snippet.film") == 0) {
+                    HANDLE tmp = nullptr;
+                    if (DuplicateHandle(proc, e.HandleValue, GetCurrentProcess(), &tmp, 0, FALSE,
+                                        DUPLICATE_CLOSE_SOURCE)) {
+                        if (tmp) CloseHandle(tmp);
+                        closed++;
+                        printf(C_GRN "[F2] closed leaked handle" C_RST C_GRY "  %s\n" C_RST, leaf);
+                    }
+                }
+            }
+        }
+        CloseHandle(dup);
+    }
+    printf(closed ? C_GRN "[F2] released %d handle(s) - F5 should work again\n" C_RST
+                  : C_YEL "[F2] no leaked clip handles found (inspected %d file handles)\n" C_RST,
+           closed ? closed : looked);
+    return closed;
+}
+
+// --- teardown: unhook + revert on ESC OR on console close/Ctrl-C/logoff ------
+// The loop only breaks on ESC; without a control handler, closing the window (X)
+// or Ctrl-C would kill us with the game still hooked/patched. g_td is populated
+// once the hook is live; doCleanup() is idempotent so both paths are safe.
+// paused/prevSpeed: set only when F8 pauses the film, so cleanup can put the
+// playback speed back exactly as we found it (and never touches a speed the
+// player set themselves).
+struct Teardown { HANDLE proc; DWORD pid; uint64_t base, hookAddr, cave; bool feOn; bool active;
+                  bool paused; float prevSpeed;
+                  bool lenSeeded; int32_t prevLen; };
+static Teardown     g_td = {};
+static volatile LONG g_cleaned = 0;
+
+static void doCleanup() {
+    if (InterlockedExchange(&g_cleaned, 1) != 0) return; // run exactly once
+    if (!g_td.active) return;
+    HANDLE proc = g_td.proc; uint64_t base = g_td.base;
+    char ob[64], nb[64];
+    printf("\n" C_BLD "[*] reverting memory:\n" C_RST);
+
+    // film-error sites: read the current (NOP'd) bytes, then restore originals.
+    if (g_td.feOn) {
+        for (int i = 0; i < g_t->nErr; i++) {
+            uint8_t cur[7] = {0};
+            rdBuf(proc, base + g_t->err[i].rva, cur, g_t->err[i].len);
+            printf(C_GRY "      film-err [%2d] +0x%-8X 0x%llX  %-20s -> %s\n" C_RST,
+                   i + 1, g_t->err[i].rva, (unsigned long long)(base + g_t->err[i].rva),
+                   hexBytes(ob, 64, cur, g_t->err[i].len),
+                   hexBytes(nb, 64, g_t->err[i].orig, g_t->err[i].len));
+        }
+        filmErrRevert(proc, base);
+    }
+
+    // SAVE-FAILED popup sites: read current bytes, then restore the stashed calls.
+    if (g_popupSaved) {
+        for (int i = 0; i < g_t->nPopup; i++) {
+            uint8_t cur[5] = {0};
+            rdBuf(proc, base + g_t->popup[i], cur, 5);
+            printf(C_GRY "      popup    [%2d] +0x%-8X 0x%llX  %-20s -> %s\n" C_RST,
+                   i + 1, g_t->popup[i], (unsigned long long)(base + g_t->popup[i]),
+                   hexBytes(ob, 64, cur, 5), hexBytes(nb, 64, g_popupOrig[i], 5));
+        }
+        popupRevert(proc, base);
+    }
+
+    // playback speed: only if F8 left the film paused - restore what it was.
+    // Skipped if it's no longer 0, i.e. the player already hit play in-game.
+    if (g_td.paused) {
+        float now = -1.0f;
+        if (rdBuf(proc, base + g_t->speed, &now, 4) && now == 0.0f) {
+            wr(proc, base + g_t->speed, g_td.prevSpeed);
+            printf(C_GRY "      speed         +0x%-8X 0x%llX  %-20s -> %.2fx\n" C_RST,
+                   g_t->speed, (unsigned long long)(base + g_t->speed), "0.00x (paused)", g_td.prevSpeed);
+        }
+    }
+
+    // keyframe capture gates: put the stock mode-2 immediates back.
+    if (g_kfOn) {
+        kfGateSet(proc, base, 2);
+        printf(C_GRY "      kf gates      +0x%-8X/+0x%-8X  imm 1 -> 2\n" C_RST,
+               g_t->kfGate[0], g_t->kfGate[1]);
+    }
+
+    // clip length budget code patch: restore the original load.
+    if (g_lenPatched) {
+        clipLenRevert(proc, base);
+        char ob2[64];
+        printf(C_GRY "      clip budget   +0x%-8X 0x%llX  mov ecx,imm32;nop -> %s\n" C_RST,
+               g_t->clipLenPatch, (unsigned long long)(base + g_t->clipLenPatch),
+               hexBytes(ob2, 64, g_lenOrig, 6));
+    }
+
+    // clip length budget: put the engine's (uninitialised) value back.
+    if (g_td.lenSeeded && g_t->clipMaxLen) {
+        wr(proc, base + g_t->clipMaxLen, g_td.prevLen);
+        printf(C_GRY "      clip len      +0x%-8X 0x%llX  %-20s -> %d\n" C_RST,
+               g_t->clipMaxLen, (unsigned long long)(base + g_t->clipMaxLen),
+               "(seeded)", g_td.prevLen);
+    }
+
+    // hook prologue: read the E9 jmp, then restore the stolen bytes.
+    {
+        uint8_t cur[8] = {0};
+        rdBuf(proc, g_td.hookAddr, cur, g_t->hookLen);
+        DWORD old;
+        VirtualProtectEx(proc, (void*)g_td.hookAddr, g_t->hookLen, PAGE_EXECUTE_READWRITE, &old);
+        wrBuf(proc, g_td.hookAddr, g_t->hookOrig, g_t->hookLen);
+        VirtualProtectEx(proc, (void*)g_td.hookAddr, g_t->hookLen, old, &old);
+        FlushInstructionCache(proc, (void*)g_td.hookAddr, g_t->hookLen);
+        printf(C_GRY "      hook          +0x%-8X 0x%llX  %-20s -> %s\n" C_RST,
+               g_t->hook, (unsigned long long)g_td.hookAddr,
+               hexBytes(ob, 64, cur, g_t->hookLen), hexBytes(nb, 64, g_t->hookOrig, g_t->hookLen));
+    }
+
+    // Release any sf_camera.blob / sf_snippet.film handle a record attempt left
+    // open. The engine never closes these and a failed retry orphans them, so
+    // leaving them behind would block record-start for the rest of the game's
+    // life - exactly the state this tool exists to avoid.
+    if (g_t && g_t->closeBlobFn)
+        releaseClipHandles(proc, g_td.pid);
+
+    VirtualFreeEx(proc, (void*)g_td.cave, 0, MEM_RELEASE);
+    CloseHandle(proc);
+    printf("\n" C_GRN "[+] restored + cleaned up (%d film + %d popup + hook + cave freed). bye.\n" C_RST,
+           g_td.feOn ? g_t->nErr : 0, g_popupSaved ? g_t->nPopup : 0);
+}
+
+static BOOL WINAPI ctrlHandler(DWORD type) {
+    switch (type) {
+        case CTRL_C_EVENT: case CTRL_BREAK_EVENT: case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT: case CTRL_SHUTDOWN_EVENT:
+            doCleanup();
+            return TRUE;
+        default: return FALSE;
+    }
+}
+
+// run() returns this when the game DLL was reloaded and we must re-attach.
+#define RUN_RESTART 2
+
+static int run() {
+    enableVT();
+    enableDebugPriv();
+
+    printf(C_GRY "Waiting for something to happen..?\n");
+    printf(C_GRY "@hybridsego \n");
+    // Stamped so a stale binary is obvious at a glance - running an old exe has
+    // cost more debugging time here than any actual bug.
+    printf(C_BLD "build " __DATE__ " " __TIME__ "\n\n" C_RST);
+
+    // Wait for the game DLL rather than giving up. MCC maps it when you enter a
+    // title and unmaps it on the way back to the menu, so starting the tool
+    // first means the patches land the instant it appears - which is the only
+    // way to catch anything that goes wrong during film load.
+    DWORD pid = 0; uint64_t base = 0;
+    if (!findModule(pid, base, g_t)) {
+        printf(C_GRY "[*] waiting for a supported game DLL to load");
+        for (int i = 0; i < N_TITLES; i++)
+            printf("%s%ls", i ? ", " : " (", TITLES[i].module);
+        printf(")...\n" C_RST);
+        for (int spin = 0; !findModule(pid, base, g_t); spin++) {
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+                printf(C_YEL "[!] cancelled.\n" C_RST);
+                return 1;
+            }
+            Sleep(100);
+        }
+        printf(C_GRN "[+]" C_RST " module appeared - attaching immediately\n");
+    }
+    printf(C_GRN "[+]" C_RST " " C_BLD "%s" C_RST "  (%ls)  pid=%lu  base=0x%llX\n",
+           g_t->name, g_t->module, pid, (unsigned long long)base);
+
+    HANDLE proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
+                              FALSE, pid);
+    if (!proc) { printf(C_RED "[!] OpenProcess failed (%lu). Run as Administrator.\n" C_RST, GetLastError()); return 1; }
+
+    const uint64_t hookAddr  = base + g_t->hook;
+    const uint64_t stateAddr = base + g_t->state;
+    const uint64_t fnStart   = base + g_t->start;
+    const uint64_t fnStop    = base + g_t->stop;
+    const uint64_t fnPoolInit= base + g_t->poolInit;
+    const uint64_t fnSkip    = base + g_t->skip;
+    const uint64_t speedAddr = base + g_t->speed;
+    const uint64_t tickAddr  = base + g_t->tick;
+    const uint64_t fnSaveReal= g_t->saveReal ? base + g_t->saveReal : 0;
+
+    // Verify the stolen prologue matches this build.
+    uint8_t cur[8];
+    if (!rdBuf(proc, hookAddr, cur, g_t->hookLen)) { printf(C_RED "[!] read hook site failed.\n" C_RST); CloseHandle(proc); return 1; }
+    if (memcmp(cur, g_t->hookOrig, g_t->hookLen) != 0) {
+        char ob[64], nb[64];
+        printf(C_RED "[!] Prologue at +0x%X != expected (build mismatch or already hooked).\n" C_RST, g_t->hook);
+        printf(C_GRY "    found %s, expected %s\n" C_RST,
+               hexBytes(ob, 64, cur, g_t->hookLen), hexBytes(nb, 64, g_t->hookOrig, g_t->hookLen));
+        CloseHandle(proc); return 1;
+    }
+
+    // Cave: {[0]=fn,[8]=a1,[16]=a2,[24]=a3}; code@+32; nameBuf@+0x200; descBuf@+0x300.
+    const SIZE_T caveSize = 0x400;
+    uint64_t cave = allocNear(proc, hookAddr, caveSize);
+    if (!cave) { printf(C_RED "[!] allocNear failed.\n" C_RST); CloseHandle(proc); return 1; }
+    const uint64_t slotAddr   = cave;
+    const uint64_t codeAddr   = cave + 32;
+    const uint64_t nameBuf    = cave + 0x200;
+    const uint64_t descBuf    = cave + 0x300;
+    const uint64_t returnAddr = hookAddr + g_t->hookLen;
+
+    // Assemble the cave: run fn(a1,a2,a3) on the game thread when the slot is set.
+    uint8_t c[0x80]; int n = 0;
+    auto b = [&](std::initializer_list<uint8_t> bytes){ for (uint8_t x : bytes) c[n++] = x; };
+    auto q = [&](uint64_t v){ for (int i = 0; i < 8; i++) c[n++] = (uint8_t)(v >> (8*i)); };
+    b({0x9C});                                       // pushfq
+    b({0x50,0x51,0x52});                             // push rax,rcx,rdx
+    b({0x41,0x50, 0x41,0x51, 0x41,0x52, 0x41,0x53}); // push r8,r9,r10,r11
+    b({0x48,0xB8}); q(slotAddr);                     // mov rax, slotAddr
+    b({0x4C,0x8B,0x10});                             // mov r10,[rax]
+    b({0x4D,0x85,0xD2});                             // test r10,r10
+    b({0x74,0x1E});                                  // je done
+    b({0x48,0x8B,0x48,0x08});                        // mov rcx,[rax+8]
+    b({0x48,0x8B,0x50,0x10});                        // mov rdx,[rax+16]
+    b({0x4C,0x8B,0x40,0x18});                        // mov r8,[rax+24]
+    b({0x48,0xC7,0x00, 0x00,0x00,0x00,0x00});        // mov qword [rax],0
+    b({0x48,0x83,0xEC,0x28});                        // sub rsp,0x28
+    b({0x41,0xFF,0xD2});                             // call r10
+    b({0x48,0x83,0xC4,0x28});                        // add rsp,0x28
+    // done:
+    b({0x41,0x5B, 0x41,0x5A, 0x41,0x59, 0x41,0x58}); // pop r11,r10,r9,r8
+    b({0x5A,0x59,0x58});                             // pop rdx,rcx,rax
+    b({0x9D});                                       // popfq
+    // the stolen prologue, replayed verbatim. Reach is `mov rax,rsp;
+    // mov [rax+10h],rbx`, Halo 3 / ODST the same with +18h - neither is
+    // RIP-relative, so a straight copy is safe.
+    for (int i = 0; i < g_t->hookLen; i++) c[n++] = g_t->hookOrig[i];
+    b({0xFF,0x25,0x00,0x00,0x00,0x00}); q(returnAddr); // jmp [rip+0]; dq returnAddr
+
+    uint8_t slotZero[32] = {0};
+    if (!wrBuf(proc, slotAddr, slotZero, 32) || !wrBuf(proc, codeAddr, c, n)) {
+        printf(C_RED "[!] writing cave failed.\n" C_RST); VirtualFreeEx(proc, (void*)cave, 0, MEM_RELEASE); CloseHandle(proc); return 1;
+    }
+
+    // Install the hook: E9 rel32 to codeAddr, NOP-padded out to the stolen length.
+    uint8_t patch[8];
+    memset(patch, 0x90, sizeof(patch));
+    int32_t rel = (int32_t)((int64_t)codeAddr - (int64_t)(hookAddr + 5));
+    patch[0] = 0xE9; memcpy(patch + 1, &rel, 4);
+    DWORD old;
+    VirtualProtectEx(proc, (void*)hookAddr, g_t->hookLen, PAGE_EXECUTE_READWRITE, &old);
+    bool hooked = wrBuf(proc, hookAddr, patch, g_t->hookLen);
+    VirtualProtectEx(proc, (void*)hookAddr, g_t->hookLen, old, &old);
+    FlushInstructionCache(proc, (void*)hookAddr, g_t->hookLen);
+    if (!hooked) { printf(C_RED "[!] hook write failed.\n" C_RST); VirtualFreeEx(proc, (void*)cave, 0, MEM_RELEASE); CloseHandle(proc); return 1; }
+    printf(C_GRN "[+]" C_RST " cave @ 0x%llX   hook @ +0x%X\n", (unsigned long long)cave, g_t->hook);
+    printf(C_GRN "[+]" C_RST " record       @ 0x%llX  (+0x%X)\n", (unsigned long long)fnStart, g_t->start);
+    printf(C_GRN "[+]" C_RST " stop/capture @ 0x%llX  (+0x%X)\n", (unsigned long long)fnStop,  g_t->stop);
+    printf(C_GRN "[+]" C_RST " skip         @ 0x%llX  (+0x%X)\n", (unsigned long long)fnSkip,  g_t->skip);
+    printf(C_GRN "[+]" C_RST " speed        @ 0x%llX  (+0x%X)\n", (unsigned long long)speedAddr, g_t->speed);
+
+    // Arm teardown now that the hook is live: also fires on window-close/Ctrl-C.
+    g_td = { proc, pid, base, hookAddr, cave, false, true, false, 1.0f, false, 0 };
+    SetConsoleCtrlHandler(ctrlHandler, TRUE);
+
+    // Request fn(a1,a2,a3) on the next game frame.
+    auto request = [&](uint64_t fn, uint64_t a1, uint64_t a2 = 0, uint64_t a3 = 0){
+        wr(proc, slotAddr + 8, a1); wr(proc, slotAddr + 16, a2); wr(proc, slotAddr + 24, a3);
+        wr(proc, slotAddr, fn);
+    };
+    auto readState = [&]() -> int32_t { int32_t s = -1; rdBuf(proc, stateAddr, &s, 4); return s; };
+    auto readTick  = [&]() -> int32_t { int32_t t = -1; rdBuf(proc, tickAddr,  &t, 4); return t; };
+    auto readSpeed = [&]() -> float   { float f = -1.f; rdBuf(proc, speedAddr, &f, 4); return f; };
+
+    // Keyframe skip: skip_arm(dir) only ARMS the jump (latches the direction into
+    // the pending-skip global); the consumer picks it up on a later frame and
+    // loads the keyframe, so poll the film tick for a moment to report where we
+    // landed. dir 1 = back, 2 = forward on all three titles.
+    // A running film advances the tick on its own (<= 22 ticks over the 250 ms
+    // window even at Reach's 3x cap), and keyframes sit on a 300-tick grid - so
+    // treat any step backwards, or a forward jump past 30 ticks (1 s), as the
+    // skip landing.
+    auto skip = [&](int dir, const char* key) {
+        const char* dirName = (dir == 1) ? "BACK" : "FORWARD";
+        int32_t t0 = readTick();
+        request(fnSkip, (uint64_t)(uint32_t)dir);
+        int32_t t1 = t0; bool jumped = false;
+        for (int i = 0; i < 25 && !jumped; i++) {
+            Sleep(10);
+            t1 = readTick();
+            jumped = (t1 < t0 - 2) || (t1 > t0 + 30);
+        }
+        if (jumped)
+            printf(C_CYN "[%s] skip %s" C_RST C_GRY "  tick %d -> %d  (%.1fs -> %.1fs)\n" C_RST,
+                   key, dirName, t0, t1, t0 / 30.0, t1 / 30.0);
+        else
+            printf(C_YEL "[%s] skip %s - no jump in 250 ms" C_RST C_GRY
+                   " (no keyframe that way, or playback not active; tick %d / %.1fs)\n" C_RST,
+                   key, dirName, t1, t1 / 30.0);
+    };
+
+    // Abort: unwedge a stuck clip/seek and get back to a clean idle state.
+    // Record-start itself arms a seek to the current tick, and the seek path
+    // parks playback at speed 0 when it arrives - so a half-finished record can
+    // leave the film paused with a seek still pending and the clip state stuck
+    // off 0, at which point the skip gate (which wants state 0) refuses too.
+    const uint64_t seekAddr = base + g_t->speed + 0x0C;  // pending seek target
+    const uint64_t sflgAddr = base + g_t->speed + 0x04;  // "seeking" byte
+    auto abortClip = [&]() {
+        int32_t st0 = readState();
+        int32_t none = -1; uint8_t zero = 0;
+        wr(proc, seekAddr, none);              // drop any pending seek
+        wr(proc, sflgAddr, zero);              // clear the seeking latch
+        if (readSpeed() == 0.0f) { wr(proc, speedAddr, 1.0f); g_td.paused = false; }
+        // Close the two files record-start opened, in the same order the engine's
+        // own teardown (sub_1800F16FC) does. Without this the handles leak for
+        // the life of the process and every later F5 dies on a SHARING VIOLATION.
+        if (g_t->closeBlobFn) {
+            request(base + g_t->closeBlobFn, base + g_t->camBlobObj);
+            Sleep(90);
+            request(base + g_t->closeWriterFn, base + g_t->filmWriterObj);
+            Sleep(90);
+            request(base + g_t->closeWriterFn, base + g_t->filmWriterObj);  // engine calls it twice
+            Sleep(90);
+        }
+        if (g_t->clipReset) request(base + g_t->clipReset, 0);   // engine's own reset
+        else { int32_t z = 0; wr(proc, stateAddr, z); }
+        Sleep(120);
+        printf(C_MAG "[F4] abort" C_RST C_GRY
+               "  state %d -> %d, seek cleared, speed %.2fx\n" C_RST,
+               st0, readState(), readSpeed());
+        if (g_t->camBlobHandle) {
+            uint64_t h = 0; rdBuf(proc, base + g_t->camBlobHandle, &h, 8);
+            printf(C_GRY "     sf_camera.blob handle now 0x%llX %s\n" C_RST,
+                   (unsigned long long)h,
+                   (h == 0 || h == ~0ull) ? "(no handle tracked - if F5 still fails, press F2)"
+                                          : "(still open)");
+        }
+    };
+
+    // Keyframe index dump. Skip back/forward navigate THIS table - if every slot
+    // is invalid there is nothing to jump to and F9/F10 can't do anything, which
+    // is the thing to check when a film won't rewind. Read-only.
+    auto keyframes = [&]() {
+        const uint32_t n = g_t->kfSlots, stride = g_t->kfStride;
+        std::vector<uint8_t> buf(n * stride);
+        if (!rdBuf(proc, base + g_t->kfTable, buf.data(), buf.size())) {
+            printf(C_YEL "[F7] couldn't read the keyframe table\n" C_RST);
+            return;
+        }
+        int32_t now = readTick();
+        printf(C_BLD "[F7] keyframe index" C_RST C_GRY
+               "  (+0x%X, %u slots x %u B)   current tick %d / %.1fs\n" C_RST,
+               g_t->kfTable, n, stride, now, now / 30.0);
+        int live = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t* e = buf.data() + i * stride;
+            int32_t tick; memcpy(&tick, e + g_t->kfTickOff, 4);
+            uint8_t valid = e[g_t->kfValidOff];
+            // Show every slot that isn't the untouched sentinel - a PICKED slot
+            // has tick 0 and valid 0 just like an empty one, and hiding those
+            // hides the interesting state.
+            bool empty = true;
+            for (uint32_t k = 0; k < stride; k++)
+                if (e[k] != 0xFF && e[k] != 0x00) empty = false;
+            if (!valid && empty) continue;
+            if (valid) live++;
+            char hx[80]; int q = 0;
+            for (uint32_t k = 0; k < stride && q < 72; k++)
+                q += snprintf(hx + q, sizeof(hx) - q, "%02X", e[k]);
+            printf(C_GRY "      [%2u] tick %-9d %7.1fs %-9s %s\n" C_RST, i, tick, tick / 30.0,
+                   valid ? "VALID" : "picked?", hx);
+        }
+        if (live) {
+            printf(C_GRN "      %d/%u slots valid - skip has targets.\n" C_RST, live, n);
+        } else {
+            printf(C_YEL "      0/%u slots valid - nothing for skip back/forward to jump to.\n"
+                   "      Any 'picked?' rows above mean the writer DID allocate a slot but\n"
+                   "      the snapshot never completed; no rows at all means it never ran.\n" C_RST, n);
+        }
+    };
+
+    // film-error + SAVE-FAILED blocking.
+    int feCount = filmErrApply(proc, base);
+    bool feOn = feCount >= 0;
+    g_td.feOn = feOn; // so the control handler reverts these too
+    if (feOn) {
+        printf(C_GRN "[+]" C_RST " film-error blocking ON (%d/%d sites):\n", feCount, g_t->nErr);
+        for (int i = 0; i < g_t->nErr; i++) {
+            uint8_t nop[7]; memset(nop, 0x90, g_t->err[i].len);
+            char ob[64], nb[64];
+            printf(C_GRY "      [%2d] +0x%-8X 0x%llX  %-20s -> %s\n" C_RST,
+                   i + 1, g_t->err[i].rva, (unsigned long long)(base + g_t->err[i].rva),
+                   hexBytes(ob, 64, g_t->err[i].orig, g_t->err[i].len),
+                   hexBytes(nb, 64, nop, g_t->err[i].len));
+        }
+    } else {
+        printf(C_YEL "[!] film-error sites didn't match this build - skipped.\n" C_RST);
+    }
+    if (g_t->nPopup > 0) {
+        int puCount = popupApply(proc, base);
+        if (puCount >= 0) {
+            const uint8_t nop5[5] = {0x90,0x90,0x90,0x90,0x90};
+            printf(C_GRN "[+]" C_RST " SAVE-FAILED popup blocking ON (%d/%d sites):\n", puCount, g_t->nPopup);
+            for (int i = 0; i < g_t->nPopup; i++) {
+                char ob[64], nb[64];
+                printf(C_GRY "      [%2d] +0x%-8X 0x%llX  %-20s -> %s\n" C_RST,
+                       i + 1, g_t->popup[i], (unsigned long long)(base + g_t->popup[i]),
+                       hexBytes(ob, 64, g_popupOrig[i], 5), hexBytes(nb, 64, nop5, 5));
+            }
+        } else {
+            printf(C_YEL "[!] SAVE-FAILED popup sites didn't match this build - skipped.\n" C_RST);
+        }
+    }
+
+    // Clip length budget: patch the load in the stop's window check.
+    if (g_t->clipLenPatch && g_forceBudget) {
+        if (clipLenApply(proc, base, g_clipLenTicks))
+            printf(C_GRN "[+]" C_RST " clip length budget patched at +0x%X" C_GRY
+                   "  (mov ecx,%d;nop)\n"
+                   "      the engine pins the real field at 0, which would make F6 impossible\n" C_RST,
+                   g_t->clipLenPatch, g_clipLenTicks);
+        else
+            printf(C_YEL "[!] clip length budget site didn't match - F6 will likely refuse.\n" C_RST);
+    }
+
+    // Turn keyframe capture on automatically. Campaign films capture nothing
+    // without it, which breaks BOTH rewind and clip recording (the clip only
+    // leaves state 1 when a keyframe is applied).
+    if (g_kfEnabled && g_t->kfGate[0]) {
+        if (kfGateSet(proc, base, 1) == 3) {
+            g_kfOn = true;
+            printf(C_GRN "[+]" C_RST " keyframe capture ON" C_GRY
+                   "  (3 gates 2->1) - campaign films capture nothing\n"
+                   "      without this, which breaks rewind AND clip recording. -nokf disables.\n" C_RST);
+        } else {
+            printf(C_YEL "[!] keyframe capture gates didn't match - rewind/clips won't work.\n" C_RST);
+        }
+    }
+
+    // Provision the save pool. This exists ONLY to make Reach's F12 commit work
+    // (Reach's pool init sub_1800D2878 is orphaned on PC, so the pool is NULL
+    // forever and the commit can't allocate its scratch buffer).
+    //
+    // It is deliberately NOT done on Halo 3 / ODST. Those titles have no F12, so
+    // there is nothing to gain - and their pool init is reachable from an .rdata
+    // table, i.e. the engine may provision its own. Re-running it would
+    // `memset` the pool manager and swap in a fresh pool, orphaning whatever the
+    // engine already had and any async op in flight. Not worth the risk for a
+    // feature those titles don't expose.
+    if (g_t->saveReal) {
+        uint64_t pool = 0; rdBuf(proc, base + g_t->pool, &pool, 8);
+        if (pool == 0) {
+            request(fnPoolInit, 0);
+            for (int i = 0; i < 40 && pool == 0; i++) { Sleep(25); rdBuf(proc, base + g_t->pool, &pool, 8); }
+        }
+        if (pool) printf(C_GRN "[+]" C_RST " save pool ready @ 0x%llX\n", (unsigned long long)pool);
+        else      printf(C_YEL "[!] save pool still NULL - enter a Theater film, save may fail.\n" C_RST);
+    } else {
+        uint64_t pool = 0; rdBuf(proc, base + g_t->pool, &pool, 8);
+        printf(C_GRY "[*] storage pool %s (left alone - only Reach's F12 needs it)\n" C_RST,
+               pool ? "already provisioned by the engine" : "NULL");
+    }
+
+    printf("\n  " C_BLD C_CYN "F4" C_RST "  = abort/unstick  " C_GRY "(clear seek + reset clip state)" C_RST);
+    printf("\n  " C_BLD C_CYN "F5" C_RST "  = record");
+    printf("\n  " C_BLD C_CYN "F6" C_RST "  = stop/capture");
+    printf("\n  " C_BLD C_CYN "F7" C_RST "  = keyframe index " C_GRY "(what skip can jump to)" C_RST);
+    printf("\n  " C_BLD C_CYN "F8" C_RST "  = pause / play");
+    printf("\n  " C_BLD C_CYN "F9" C_RST "  = skip back      " C_GRY "(prev keyframe, ~10 s)" C_RST);
+    printf("\n  " C_BLD C_CYN "F10" C_RST " = skip forward   " C_GRY "(next keyframe, ~10 s)" C_RST);
+    if (g_kfEnabled && g_t->kfGate[0])
+        printf("\n  " C_BLD C_CYN "F3" C_RST "  = keyframe capture toggle " C_GRY
+               "(ON by default; needed for rewind AND clips)" C_RST);
+    //if (fnSaveReal) printf("\n  " C_BLD C_CYN "F12" C_RST " = force save");
+    printf("\n  " C_BLD C_CYN "ESC" C_RST " = quit\n");
+    printf(C_GRY "\n[*] (start recording while the film is PLAYING; saved .film lands in the game root folder)\n\n" C_RST);
+
+    bool p1=false, p2=false, p3=false, p4=false, p5=false, p6=false, p7=false, p8=false, p9=false, p10=false, p11=false, p12=false;
+    int lastState = -99;
+    int kfPoll = 0, kfLastLive = -1, kfLastErr = 0;
+    uint64_t kfLastFile = 0;
+    bool kfSawFile = false;
+    bool kfSuspended = false;
+    int32_t errLastCode = 0; DWORD errLastMs = 0; int errRepeat = 0;
+    int modCheck = 0, patchCheck = 0;
+    uint32_t kfLastSum = 0;
+    bool kfWarnedRevert = false;
+    std::vector<uint8_t> kfPrev;
+    for (;;) {
+        bool d4  = (GetAsyncKeyState(VK_F4)  & 0x8000) != 0;
+        bool d5  = (GetAsyncKeyState(VK_F5)  & 0x8000) != 0;
+        bool d6  = (GetAsyncKeyState(VK_F6)  & 0x8000) != 0;
+        bool d7  = (GetAsyncKeyState(VK_F7)  & 0x8000) != 0;
+        bool d8  = (GetAsyncKeyState(VK_F8)  & 0x8000) != 0;
+        bool d9  = (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
+        bool d10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        bool d1  = (GetAsyncKeyState(VK_F1)  & 0x8000) != 0;
+        bool d2  = (GetAsyncKeyState(VK_F2)  & 0x8000) != 0;
+        bool d3  = (GetAsyncKeyState(VK_F3)  & 0x8000) != 0;
+        bool d12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+        bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+
+        int32_t st = readState();
+        if (st != lastState) {
+            int32_t sk = -1; rdBuf(proc, seekAddr, &sk, 4);
+            printf(C_GRY "    state = %-3d  tick %d (%.1fs)  speed %.2fx%s\n" C_RST,
+                   st, readTick(), readTick() / 30.0, readSpeed(),
+                   sk != -1 ? "  [seek pending]" : "");
+            lastState = st;
+        }
+
+        if (d4 && !p4) abortClip();
+
+        if (d5 && !p5) {
+            if (st != 0) {
+                printf(C_YEL "[F5] ignored (state %d, must be 0/idle) - F4 aborts a stuck clip\n" C_RST, st);
+            } else {
+                float before = readSpeed();
+                // Seed the clip length budget first. Halo 3 / ODST never
+                // initialise it, and STOP needs clipStart + budget - tick >= 0,
+                // so at 0 the clip becomes unstoppable the moment the film
+                // advances a tick. Only touched when the engine left it at 0.
+                request(fnStart, 0);
+                // Record-start seeks to the current tick, and the seek path parks
+                // playback at speed 0 once it arrives. A clip only advances while
+                // the film is PLAYING, so resume once the seek has settled.
+                int32_t ns = -99;
+                for (int i = 0; i < 40; i++) {
+                    Sleep(25);
+                    ns = readState();
+                    int32_t sk = -1; rdBuf(proc, seekAddr, &sk, 4);
+                    if (ns != 0 && sk == -1) break;
+                }
+                if (ns == 0) {
+                    printf(C_YEL "[F5] record-start didn't take (still state 0).\n" C_RST);
+                    if (g_t->camBlobHandle) {
+                        uint64_t h = 0; int32_t md = -1, ws = -1;
+                        rdBuf(proc, base + g_t->camBlobHandle, &h, 8);
+                        rdBuf(proc, base + g_t->camBlobMode, &md, 4);
+                        rdBuf(proc, base + g_t->filmWriterState, &ws, 4);
+                        bool blobOk = (h != 0 && h != ~0ull);
+                        bool writerOk = (ws == 0 || ws == 1);
+                        printf(C_GRY "     step 1 open sf_camera.blob : %s (handle 0x%llX, mode %d)\n"
+                               "     step 2 create film writer  : %s (state %d)\n"
+                               "     step 3 seek to current tick: %s\n" C_RST,
+                               blobOk ? "OK" : "FAILED", (unsigned long long)h, md,
+                               writerOk ? "OK" : "not open", ws,
+                               (blobOk && writerOk) ? "the one that failed" : "not reached");
+                        if (!blobOk)
+                            printf(C_YEL "     sf_camera.blob is still held open by an earlier attempt.\n"
+                                   "     The engine opens it ShareMode:None, so CreateFile returns a\n"
+                                   "     SHARING VIOLATION - and on failure it overwrites the object's\n"
+                                   "     handle with -1, so the real OS handle is ORPHANED and no engine\n"
+                                   "     close can reach it.  >> Press F2, then F5.\n" C_RST);
+                    }
+                    clipDiag(proc, base, "F5 refused");
+                } else {
+                    float now = readSpeed();
+                    if (now == 0.0f) {
+                        float back = (before > 0.0f) ? before : 1.0f;
+                        wr(proc, speedAddr, back);
+                        g_td.paused = false;
+                        printf(C_CYN "[F5] record" C_RST C_GRY "  (state %d; resumed %.2fx - "
+                               "a clip only advances while playing)\n" C_RST, ns, back);
+                    } else {
+                        printf(C_CYN "[F5] record" C_RST C_GRY "  (state %d, %.2fx)\n" C_RST, ns, now);
+                    }
+                    // Recording only starts when a KEYFRAME IS APPLIED. State 1 is
+                    // a no-op in sub_1801CF3BC (returns false -> the caller raises
+                    // film-error 3 every frame); the only thing that advances 1->2
+                    // is sub_1800F2364, and its ONLY caller is sub_1801CE468 -
+                    // apply-keyframe. Record-start arms a seek; the seek loads a
+                    // keyframe; applying it runs the film-writer setup and moves
+                    // the state on. With an empty ring the seek has nothing to
+                    // apply, so the clip sits in state 1 forever.
+                    //
+                    // Forcing the state to 2 by hand does NOT work - it skips
+                    // sub_180107C28's setup, and the frame writes then fail and
+                    // set the writer error byte (measured).
+                    if (ns == 1) {
+                        int live = 0;
+                        std::vector<uint8_t> kb((size_t)g_t->kfSlots * g_t->kfStride);
+                        if (rdBuf(proc, base + g_t->kfTable, kb.data(), kb.size()))
+                            for (int i = 0; i < g_t->kfSlots; i++)
+                                if (kb[(size_t)i * g_t->kfStride + g_t->kfValidOff]) live++;
+                        if (live == 0)
+                            printf(C_YEL "     no keyframes exist (0/%u) - recording CANNOT start.\n" C_RST
+                                   C_GRY "     The clip only leaves state 1 when a keyframe is applied\n"
+                                   "     (sub_1801CE468 -> sub_1800F2364). Enable capture first:\n"
+                                   "     run with -kf, press F3, let the film play past a 600-tick\n"
+                                   "     boundary until F7 shows valid slots, THEN F5.\n" C_RST,
+                                   g_t->kfSlots);
+                        else
+                            printf(C_GRY "     %d/%u keyframes exist; waiting for one to be applied to\n"
+                                   "     move the clip out of state 1.\n" C_RST, live, g_t->kfSlots);
+                    }
+                }
+            }
+        }
+        if (d6 && !p6) {
+            if (st >= 1 && st < 4) {
+                // Data seeding is futile - measured: the write lands and the
+                // engine re-zeroes the field within a frame. The budget is now
+                // supplied by patching the LOAD (clipLenApply) instead. Kept only
+                // as a fallback for titles with no patch site mapped.
+                if (g_t->clipMaxLen && !g_t->clipLenPatch) {
+                    int32_t cur = 0; rdBuf(proc, base + g_t->clipMaxLen, &cur, 4);
+                    if (cur <= 0) {
+                        if (!g_td.lenSeeded) { g_td.prevLen = cur; g_td.lenSeeded = true; }
+                        bool ok = wr(proc, base + g_t->clipMaxLen, g_clipLenTicks);
+                        int32_t back = -12345; rdBuf(proc, base + g_t->clipMaxLen, &back, 4);
+                        printf(C_GRY "     budget %d -> wrote %d (%s), reads back %d%s\n" C_RST,
+                               cur, g_clipLenTicks, ok ? "ok" : "WRITE FAILED", back,
+                               back == g_clipLenTicks ? "" : "  <- the engine is re-zeroing it");
+                    }
+                }
+                // sub_180107E04 (the writer finalise the stop calls) refuses
+                // unless the writer's state field is 0 or 1, and NOTHING in the
+                // binary writes that field - sub_180107590 creates the writer
+                // without setting it, so it sits at -1 and the stop can never
+                // get past condition 2. Nothing else touches it, so a value we
+                // put here sticks. 1 = "open for writing", which is the state
+                // the finalise path expects (it then flushes and renames to
+                // .film). EXPERIMENTAL: if the object isn't really in that
+                // state this could fault - leaving the film recovers.
+                if (g_t->filmWriterState) {
+                    int32_t ws = -1; rdBuf(proc, base + g_t->filmWriterState, &ws, 4);
+                    if (ws != 0 && ws != 1) {
+                        int32_t one = 1;
+                        wr(proc, base + g_t->filmWriterState, one);
+                        int32_t rb = -1; rdBuf(proc, base + g_t->filmWriterState, &rb, 4);
+                        printf(C_GRY "     writer state was %d (nothing in the engine ever sets it) "
+                               "-> wrote 1, reads %d\n" C_RST, ws, rb);
+                    }
+                }
+                // sub_1801CFA0C returns 0 outright unless the camera blob's
+                // field at +140 is exactly 1, and sub_1800B4E78 only writes that
+                // field at open time for modes 0 and 1:
+                //     if (a3 == 1) *(a1+140) = 0;  else if (!a3) *(a1+140) = 1;
+                // Record-start opens the blob with mode 2, so neither branch runs
+                // and it keeps a stale -1 forever - the stop can never clear its
+                // third condition. Nothing writes it during recording, so seeding
+                // it here sticks. All it gates is padding the blob to a 16-byte
+                // boundary, and the file is open for writing with a live handle.
+                if (g_t->camBlobObj) {
+                    int32_t gate = -1; rdBuf(proc, base + g_t->camBlobObj + 140, &gate, 4);
+                    if (gate != 1) {
+                        int32_t one = 1;
+                        wr(proc, base + g_t->camBlobObj + 140, one);
+                        int32_t rb = -1; rdBuf(proc, base + g_t->camBlobObj + 140, &rb, 4);
+                        printf(C_GRY "     camblob +140 was %d (mode-2 open never sets it) "
+                               "-> wrote 1, reads %d\n" C_RST, gate, rb);
+                    }
+                }
+
+                // Snapshot the deciding values BEFORE the stop runs. Reading
+                // them afterwards shows the aftermath - sub_180107E04 closes the
+                // film file and leaves the writer state at -1 whether it
+                // succeeded or not - which reads like a precondition failure
+                // when it isn't one.
+                int32_t preWs = -1, preGate = -1; uint8_t preErr = 0xFF;
+                if (g_t->filmWriterState) rdBuf(proc, base + g_t->filmWriterState, &preWs, 4);
+                if (g_t->camBlobObj)      rdBuf(proc, base + g_t->camBlobObj + 140, &preGate, 4);
+                if (g_t->filmWriterErr)   rdBuf(proc, base + g_t->filmWriterErr, &preErr, 1);
+
+                request(fnStop, 0);
+                // The stop only reaches state 4 if the writer finalise AND the
+                // camera-blob padding pass both succeed, so confirm rather than
+                // assume - a silent no-op here is what "can't stop" looks like.
+                int32_t ns = st;
+                for (int i = 0; i < 30 && ns == st; i++) { Sleep(25); ns = readState(); }
+                if (ns == 4) {
+                    printf(C_CYN "[F6] stop/capture" C_RST C_GRY "  (state %d, clip is ready)\n" C_RST, ns);
+                    // sub_1801CF3BC case 4 returns FALSE unless the film is
+                    // paused, and the caller turns that into film-error 3 every
+                    // frame. The engine pauses itself at the equivalent
+                    // transition (case 6 calls sub_1800F2FB8(0.0, 1)), so match
+                    // it - the clip is captured and waiting for save/discard.
+                    if (readSpeed() != 0.0f) {
+                        g_td.prevSpeed = readSpeed(); g_td.paused = true;
+                        wr(proc, speedAddr, 0.0f);
+                        printf(C_GRY "     paused - state 4 requires speed 0 or the engine\n"
+                               "     raises film-error 3 every frame. F8 resumes.\n" C_RST);
+                    }
+                } else if (ns != st) {
+                    printf(C_CYN "[F6] stop/capture" C_RST C_GRY "  (state %d)\n" C_RST, ns);
+                } else {
+                    printf(C_YEL "[F6] stop REFUSED - still state %d.\n" C_RST, ns);
+                    printf(C_BLD "   BEFORE the stop ran (these are the real preconditions):\n" C_RST);
+                    printf("     writer state  %-4d %s\n     writer err    %-4u %s\n"
+                           "     camblob +140  %-4d %s\n",
+                           preWs,  (preWs == 0 || preWs == 1) ? C_GRN "ok - sub_180107E04 got a valid writer" C_RST
+                                                              : C_RED "BAD - needs 0 or 1" C_RST,
+                           preErr, preErr == 0 ? C_GRN "ok" C_RST : C_RED "BAD - must be 0" C_RST,
+                           preGate, preGate == 1 ? C_GRN "ok" C_RST
+                                                 : C_RED "BAD - sub_1801CFA0C returns 0 unless this is 1" C_RST);
+                    clipDiag(proc, base, "F6 refused - values below are POST-stop");
+                    printf(C_GRY "     F4 aborts and closes the files.\n" C_RST);
+                }
+            }
+            else printf(C_YEL "[F6] ignored (state %d, must be 1..3/recording)\n" C_RST, st);
+        }
+
+        if (d7 && !p7) keyframes();
+
+        // F1: hold the film open. sub_180109C00 loads the end tick from the film
+        // header into dword_182137170 (speed+0x1C) at load, and sub_1800F1850
+        // auto-seeks to it - which is how a film "finishes" and drops you back
+        // to the menu. On a clip film that end tick is the clip's short length,
+        // so playback can reach the end almost immediately. Holding it at -1
+        // disables the auto-seek and keeps you in the film.
+        if (d1 && !p1) {
+            g_holdOpen = !g_holdOpen;
+            int32_t et = -1; rdBuf(proc, base + g_t->speed + 0x1C, &et, 4);
+            printf(C_CYN "[F1] hold film open %s" C_RST C_GRY "  (end tick currently %d)\n" C_RST,
+                   g_holdOpen ? "ON - end tick forced to -1, no auto-exit" : "OFF", et);
+        }
+        if (g_holdOpen) {
+            int32_t et = -1; rdBuf(proc, base + g_t->speed + 0x1C, &et, 4);
+            if (et != -1) {
+                int32_t none = -1;
+                wr(proc, base + g_t->speed + 0x1C, none);
+                printf(C_GRY "[F1] cleared end tick %d (%.1fs) - would have exited the film\n" C_RST,
+                       et, et / 30.0);
+            }
+        }
+
+        // F3: keyframe capture during playback (experimental, -kf only)
+        if (d3 && !p3) {
+            if (!g_kfEnabled) {
+                printf(C_YEL "[F3] keyframe capture is disabled - it can break the film.\n" C_RST
+                       C_GRY "     Pass -kf to enable it.\n" C_RST);
+            } else if (!g_t->kfGate[0]) {
+                printf(C_YEL "[F3] capture gates not mapped for %s\n" C_RST, g_t->name);
+            } else if (g_kfOn) {
+                if (kfGateSet(proc, base, 2) == 3) {
+                    g_kfOn = false;
+                    printf(C_CYN "[F3] keyframe capture OFF\n" C_RST);
+                } else {
+                    printf(C_YEL "[F3] could not restore the gates\n" C_RST);
+                }
+            } else {
+                int n = kfGateSet(proc, base, 1);
+                if (n == 3) {
+                    g_kfOn = true; kfLastLive = -1; kfLastFile = 0;
+                    kfSawFile = false; kfLastErr = 0; kfLastSum = 0;
+                    kfWarnedRevert = false; kfPrev.clear();
+                    int32_t t0 = readTick();
+                    int32_t nextB = ((t0 / 600) + 1) * 600;
+                    printf(C_CYN "[F3] keyframe capture ON" C_RST C_GRY
+                           "  (3 gates 2->1: 2 in the writer, 1 in the\n"
+                           "      caller that publishes the index entry)\n"
+                           "      You are at %d; next 600-tick boundary %d (%d ticks / ~%.0fs).\n" C_RST,
+                           t0, nextB, nextB - t0, (nextB - t0) / 30.0);
+                    if (readSpeed() == 0.0f)
+                        printf(C_YEL "      THE FILM IS PAUSED - press F8 or the tick never advances.\n" C_RST);
+                } else {
+                    printf(C_YEL "[F3] gate sites did not match this build - skipped.\n" C_RST);
+                }
+            }
+        }
+
+        // Pause/play: the speed float is directly writable (0.0 = paused; the
+        // engine clamps the top end at 3.0 in Reach, 30.0 in Halo 3 / ODST).
+        // Resume restores the speed we paused from, so slow-mo survives a pause.
+        if (d8 && !p8) {
+            float sp = readSpeed();
+            if (sp < 0.0f) {
+                printf(C_YEL "[F8] could not read playback speed\n" C_RST);
+            } else if (sp > 0.0f) {
+                g_td.prevSpeed = sp; g_td.paused = true;
+                wr(proc, speedAddr, 0.0f);
+                int32_t t = readTick();
+                printf(C_CYN "[F8] pause" C_RST C_GRY "  (was %.2fx, tick %d / %.1fs)\n" C_RST,
+                       sp, t, t / 30.0);
+            } else {
+                float back = (g_td.prevSpeed > 0.0f) ? g_td.prevSpeed : 1.0f;
+                wr(proc, speedAddr, back);
+                g_td.paused = false;
+                printf(C_CYN "[F8] play" C_RST C_GRY "  (%.2fx)\n" C_RST, back);
+            }
+        }
+
+        if (d9  && !p9)  skip(1, "F9");
+        if (d10 && !p10) skip(2, "F10");
+
+        if (d12 && !p12) {
+            if (!fnSaveReal) {
+                printf(C_YEL "[F12] no direct save entry on %s - use the in-game save flow.\n" C_RST,
+                       g_t->name);
+            } else if (st == 4) {
+                static const wchar_t NM[] = L"ClippingPrototype";
+                static const wchar_t DS[] = L"saved by theater_utils";
+                wrBuf(proc, nameBuf, NM, sizeof(NM));
+                wrBuf(proc, descBuf, DS, sizeof(DS));
+                int32_t id = 0; rdBuf(proc, base + g_t->clipId, &id, 4);
+                request(fnSaveReal, (uint64_t)(uint32_t)id, nameBuf, descBuf);
+                printf(C_CYN "[F12] save (id=%d)\n" C_RST, id);
+            } else {
+                printf(C_YEL "[F12] ignored (state %d, must be 4/captured)\n" C_RST, st);
+            }
+        }
+
+        // FILM-ERROR WATCH. The 13 flag raises are NOP'd so the game never shows
+        // the error screen, but each raise still writes its CODE - which makes
+        // this a free always-on diagnostic. Report every new one with a full
+        // dump, then clear the code so the next is visible too. Repeats of the
+        // same code are counted rather than spammed (code 3 fires every frame
+        // when a clip is stuck).
+        {
+            int32_t ec = 0;
+            rdBuf(proc, base + g_t->speed + 0x50, &ec, 4);
+            if (ec != 0) {
+                DWORD nowMs = GetTickCount();
+                if (ec != errLastCode || nowMs - errLastMs > 3000) {
+                    if (ec == errLastCode && errRepeat > 0)
+                        printf(C_GRY "     (previous code %d repeated %d times)\n" C_RST,
+                               errLastCode, errRepeat);
+                    const char* where = "unmapped";
+                    for (int i = 0; i < g_t->nCodes; i++)
+                        if (g_t->codes[i].code == (uint8_t)ec) { where = g_t->codes[i].where; break; }
+                    // Code 3 at state 4 with the film playing is the benign
+                    // "clip captured, engine wants playback stopped" case - the
+                    // full clip dump there is stale post-stop data and misleads.
+                    if (ec == 3 && st == 4 && readSpeed() != 0.0f) {
+                        printf(C_YEL "[!] film-error 3: a clip is captured (state 4) and the engine\n"
+                               "    wants playback paused. Press F8, or save/discard the clip.\n" C_RST);
+                    } else {
+                        printf(C_RED "\n[!] FILM ERROR code %d" C_RST C_BLD "  %s\n" C_RST, ec, where);
+                        clipDiag(proc, base, "film error");
+                    }
+                    errLastCode = ec; errLastMs = nowMs; errRepeat = 0;
+                } else {
+                    errRepeat++;
+                }
+                int32_t z = 0;
+                wr(proc, base + g_t->speed + 0x50, z);   // clear so the next one shows
+            }
+        }
+
+        // Mirror the engine's own rule: keyframe capture is SUPPRESSED while a
+        // clip is recording. sub_1800361A8 does
+        //     cmp cs:<clipState>,0 ; cmovnz r10d,1
+        // and the writer skips the capture when that argument is non-zero - a
+        // 9.9 MB snapshot mid-recording contends with the clip's frame writes
+        // and they share the sub_180132BFC(2048) state-buffer lock. Our gate
+        // patch re-enables capture globally, so without this it fires during
+        // recording where stock code never would, and the clip errors out.
+        if (g_t->kfGate[0] && g_kfEnabled) {
+            bool recording = (st != 0);
+            if (recording && g_kfOn) {
+                if (kfGateSet(proc, base, 2) == 3) {
+                    g_kfOn = false; kfSuspended = true;
+                    printf(C_GRY "[kf] capture suspended while the clip records "
+                           "(the engine does the same)\n" C_RST);
+                }
+            } else if (!recording && kfSuspended) {
+                if (kfGateSet(proc, base, 1) == 3) {
+                    g_kfOn = true; kfSuspended = false;
+                    kfLastSum = 0; kfPrev.clear();
+                    printf(C_GRY "[kf] capture resumed\n" C_RST);
+                }
+            }
+        }
+
+        // While capture is on, report what the writer actually does.
+        if (g_kfOn && ++kfPoll >= 12) {          // ~every 200 ms
+            kfPoll = 0;
+            uint64_t fh = 0; rdBuf(proc, base + g_t->kfTable - 8, &fh, 8);
+            std::vector<uint8_t> kb((size_t)g_t->kfSlots * g_t->kfStride);
+            int live = 0;
+            if (rdBuf(proc, base + g_t->kfTable, kb.data(), kb.size()))
+                for (int i = 0; i < g_t->kfSlots; i++)
+                    if (kb[(size_t)i * g_t->kfStride + g_t->kfValidOff]) live++;
+
+            // NOTE: this pointer is also set by sub_1800F1850 (per-frame update)
+            // and sub_1801CE258 (reader), so it is NOT proof the writer ran.
+            if (fh && !kfSawFile) {
+                kfSawFile = true;
+                printf(C_GRY "[kf] scratch file pointer set @ 0x%llX (writer, reader or update -\n"
+                       "     not proof of capture; watch for a ring change)\n" C_RST,
+                       (unsigned long long)fh);
+            }
+
+            // Print the RAW bytes of every slot that changed. A picked slot is
+            // byte-identical to an empty one in both the tick and valid fields,
+            // so decoding those two throws away the state we are hunting.
+            uint32_t sum = 2166136261u;
+            for (size_t i = 0; i < kb.size(); i++) { sum ^= kb[i]; sum *= 16777619u; }
+            if (sum != kfLastSum) {
+                bool first = kfPrev.empty();
+                if (first) kfPrev.assign(kb.begin(), kb.end());
+                kfLastSum = sum;
+                int changed = 0;
+                for (int i = 0; i < g_t->kfSlots; i++) {
+                    const uint8_t* e = kb.data() + (size_t)i * g_t->kfStride;
+                    const uint8_t* o = kfPrev.data() + (size_t)i * g_t->kfStride;
+                    if (!first && memcmp(e, o, g_t->kfStride) == 0) continue;
+                    if (first) {
+                        bool empty = true;
+                        for (int k = 0; k < g_t->kfStride; k++)
+                            if (e[k] != 0xFF && e[k] != 0x00) empty = false;
+                        if (empty) continue;
+                    }
+                    changed++;
+                    int32_t tk; memcpy(&tk, e + g_t->kfTickOff, 4);
+                    char hx[80]; int q = 0;
+                    for (int k = 0; k < g_t->kfStride && q < 72; k++)
+                        q += snprintf(hx + q, sizeof(hx) - q, "%02X", e[k]);
+                    printf(C_GRN "[kf] slot %-2d" C_RST " tick=%-8d valid=%u  %s\n",
+                           i, tk, e[g_t->kfValidOff], hx);
+                }
+                if (changed)
+                    printf(C_GRY "     (^ ring changed at film tick %d)\n" C_RST, readTick());
+                kfPrev.assign(kb.begin(), kb.end());
+            }
+            if (live > 0 && live != kfLastLive)
+                printf(C_GRN "[kf] %d/%u slot%s VALID -> F9 can skip back now\n" C_RST,
+                       live, g_t->kfSlots, live == 1 ? "" : "s");
+            kfLastFile = fh; kfLastLive = live;
+
+            // Writing the gates once is not the same as them still being 1 later.
+            {
+                uint8_t gb[3] = {0, 0, 0};
+                bool gLive = true;
+                for (int i = 0; i < 3; i++) {
+                    rdBuf(proc, base + g_t->kfGate[i] + 3, &gb[i], 1);
+                    if (gb[i] != 1) gLive = false;
+                }
+                if (!gLive && !kfWarnedRevert) {
+                    kfWarnedRevert = true;
+                    printf(C_RED "[kf] the gate patch is NO LONGER APPLIED" C_RST C_GRY
+                           "  (imm now %u/%u/%u, expected 1/1/1)\n" C_RST, gb[0], gb[1], gb[2]);
+                }
+            }
+
+            // Any error code, not just 10 - the code global still records even
+            // though the flag raises are NOP'd.
+            int32_t ec = 0; rdBuf(proc, base + g_t->speed + 0x50, &ec, 4);
+            if (ec && ec != kfLastErr) {
+                kfLastErr = ec;
+                printf(C_YEL "[kf] film-error code %d raised" C_RST C_GRY
+                       "  (10 = keyframe writer, 12 = apply keyframe, 13 = seek consume,\n"
+                       "      2 = per-frame update, 3 = sim tick)\n" C_RST, ec);
+            }
+            if (ec == 10) {
+                if (kfGateSet(proc, base, 2) == 3) g_kfOn = false;
+                int32_t z = 0; wr(proc, base + g_t->speed + 0x50, z);
+                printf(C_MAG "[kf] capture FAILED (writer error 10) - reverted automatically.\n" C_RST);
+            }
+        }
+
+        // save-failed auto-recover: state-12 commit completed with failure
+        // (OP+5812 != 0, OP+5820 == 0) -> force state 15 so it does not hang.
+        if (st == 12 && g_t->opBase) {
+            int32_t comp = 0, succ = 0;
+            rdBuf(proc, base + g_t->opBase + 5812, &comp, 4);
+            rdBuf(proc, base + g_t->opBase + 5820, &succ, 4);
+            if (comp != 0 && succ == 0) {
+                int32_t s15 = 15; wr(proc, stateAddr, s15);
+                printf(C_MAG "[auto] save failed - recovered (state 15).\n" C_RST);
+            }
+        }
+
+        p1 = d1; p2 = d2; p3 = d3; p4 = d4; p5 = d5; p6 = d6; p7 = d7;
+        p8 = d8; p9 = d9; p10 = d10; p12 = d12;
+        if (esc) break;
+
+        // Re-apply every patch once a second, unconditionally. MCC tears down
+        // and reloads a film session in place - .text comes back from disk at
+        // the SAME base - so the patches silently revert with nothing to detect
+        // from the base alone. Rewriting them blind is far simpler than trying
+        // to spot every way the game can reset them, and writing bytes that are
+        // already correct costs nothing. Reports only when something had
+        // actually reverted, so the log stays quiet.
+        if (++patchCheck >= 60) {               // ~1 s
+            patchCheck = 0;
+            uint8_t probe = 0;
+            bool wasGone = g_td.feOn &&
+                           rdBuf(proc, base + g_t->err[0].rva, &probe, 1) && probe != 0x90;
+            if (g_td.feOn) filmErrApply(proc, base);
+            if (g_t->nPopup > 0) popupApply(proc, base);
+            if (g_kfOn && !kfSuspended && g_t->kfGate[0]) kfGateSet(proc, base, 1);
+            if (g_forceBudget && g_t->clipLenPatch) clipLenApply(proc, base, g_clipLenTicks);
+            if (wasGone) {
+                printf(C_YEL "\n[!] the game had reset our patches (film session reloaded in\n"
+                       "    place) - re-applied.\n" C_RST);
+                kfLastSum = 0; kfPrev.clear(); kfLastLive = -1;
+            }
+        }
+
+        // MCC unmaps the game DLL when you leave a title and maps it at a NEW
+        // base on re-entry, which silently invalidates every address we hold.
+        // Detect that and re-attach instead of writing to a dead mapping.
+        if (++modCheck >= 60) {                 // ~every second
+            modCheck = 0;
+            DWORD npid = 0; uint64_t nbase = 0; const Title* nt = nullptr;
+            bool present = findModule(npid, nbase, nt);
+            if (!present || nbase != base || npid != pid) {
+                printf(C_YEL "\n[!] the game DLL was %s - our patches went with it.\n" C_RST,
+                       present ? "reloaded at a new base" : "unloaded");
+                // The old mapping is gone; don't try to write to it on the way out.
+                g_td.active = false;
+                CloseHandle(proc);
+                printf(C_GRY "    re-attaching...\n\n" C_RST);
+                return RUN_RESTART;
+            }
+        }
+        Sleep(16);
+    }
+
+    // restore everything (same path the console control handler uses).
+    doCleanup();
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-nokf")) {
+            g_kfEnabled = false;
+        } else if ((!strcmp(argv[i], "-len") || !strcmp(argv[i], "-budget")) && i + 1 < argc) {
+            int secs = atoi(argv[++i]);
+            if (secs > 0) { g_clipLenTicks = secs * 30; g_forceBudget = true; }
+        }
+    }
+    // run() returns RUN_RESTART when the game DLL was unloaded/reloaded; loop so
+    // the tool keeps working across leaving and re-entering a title, re-patching
+    // at the new base each time.
+    int rc;
+    do {
+        g_cleaned    = 0;          // doCleanup is one-shot per attach
+        g_td         = {};
+        g_lenPatched = false;
+        g_popupSaved = false;
+        g_kfOn       = false;
+        rc = run();
+    } while (rc == RUN_RESTART);
+
+    printf("\nPress Enter to exit...");
+    (void)getchar();
+    return rc;
+}
